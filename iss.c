@@ -1,6 +1,6 @@
 // iss — Instant Space Switcher
 //
-// Eliminates the macOS sliding animation when 3-finger swiping between spaces.
+// Eliminates the macOS sliding animation when switching spaces.
 //
 // How it works:
 //   1. A session-level CGEventTap intercepts horizontal trackpad dock-swipe
@@ -39,19 +39,19 @@
 // trackpad gesture routing. They were discovered via reverse engineering.
 static const CGEventField kCGSEventTypeField            = 55;  // real event type
 static const CGEventField kCGEventGestureHIDType        = 110; // IOHIDEventType
+static const CGEventField kCGEventGestureSwipeMask      = 115;
 static const CGEventField kCGEventGestureScrollY        = 119;
 static const CGEventField kCGEventGestureSwipeMotion    = 123; // horiz vs vert
 static const CGEventField kCGEventGestureSwipeProgress  = 124; // cumulative distance
+static const CGEventField kCGEventGestureSwipePositionX = 125;
+static const CGEventField kCGEventGestureSwipePositionY = 126;
 static const CGEventField kCGEventGestureSwipeVelocityX = 129;
 static const CGEventField kCGEventGestureSwipeVelocityY = 130;
 static const CGEventField kCGEventGesturePhase          = 132; // began/changed/ended
-static const CGEventField kCGEventScrollGestureFlagBits = 135; // direction hint
-static const CGEventField kCGEventGestureZoomDeltaX     = 139; // required, reason unknown
-static const CGEventField kCGEventGestureSwipeMask      = 115;
-static const CGEventField kCGEventGestureSwipePositionX = 125;
-static const CGEventField kCGEventGestureSwipePositionY = 126;
 static const CGEventField kCGEventGesturePhaseAlias     = 134;
+static const CGEventField kCGEventScrollGestureFlagBits = 135; // direction hint
 static const CGEventField kCGEventGestureZoomDeltaY     = 138;
+static const CGEventField kCGEventGestureZoomDeltaX     = 139; // required, reason unknown
 static const CGEventField kCGEventSourceProcessAlias    = 169;
 static const CGEventField kCGEventRawIOHIDPayload       = 4205;
 
@@ -60,13 +60,6 @@ enum { kIOHIDEventTypeDockSwipe = 23 };
 enum { kCGGestureMotionHorizontal = 1 };
 enum { kGestureBegan = 1, kGestureChanged = 2, kGestureEnded = 4, kGestureCancelled = 8 };
 enum { kVK_LeftArrow = 123, kVK_RightArrow = 124 };
-
-// macOS 26 reports horizontal swipe direction opposite to earlier releases.
-#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
-#define ISS_SWIPE_DIRECTION_REVERSED 1
-#else
-#define ISS_SWIPE_DIRECTION_REVERSED 0
-#endif
 
 extern int CGSMainConnectionID(void);
 extern uint64_t CGSGetActiveSpace(int cid);
@@ -131,16 +124,16 @@ static int32_t double_to_fixed1616(double value) {
 }
 
 static uint8_t *generate_iohid_payload(CGEventRef event, size_t *out_length) {
-    int64_t phase = CGEventGetIntegerValueField(event, (CGEventField)132);
-    int64_t motion = CGEventGetIntegerValueField(event, (CGEventField)123);
-    double progress = CGEventGetDoubleValueField(event, (CGEventField)124);
+    int64_t phase = CGEventGetIntegerValueField(event, kCGEventGesturePhase);
+    int64_t motion = CGEventGetIntegerValueField(event, kCGEventGestureSwipeMotion);
+    double progress = CGEventGetDoubleValueField(event, kCGEventGestureSwipeProgress);
     double pos_x = CGEventGetDoubleValueField(event, kCGEventGestureSwipePositionX);
     double pos_y = CGEventGetDoubleValueField(event, kCGEventGestureSwipePositionY);
-    double vel_x = CGEventGetDoubleValueField(event, (CGEventField)129);
-    double vel_y = CGEventGetDoubleValueField(event, (CGEventField)130);
+    double vel_x = CGEventGetDoubleValueField(event, kCGEventGestureSwipeVelocityX);
+    double vel_y = CGEventGetDoubleValueField(event, kCGEventGestureSwipeVelocityY);
     int64_t swipe_mask = CGEventGetIntegerValueField(event, kCGEventGestureSwipeMask);
 
-    bool include_velocity = (vel_x != 0.0 || vel_y != 0.0 || phase == 4);
+    bool include_velocity = (vel_x != 0.0 || vel_y != 0.0 || phase == kGestureEnded);
     uint32_t event_count = include_velocity ? 2 : 1;
     size_t payload_length = sizeof(IOHIDSystemQueueElementHeader)
                           + sizeof(IOHIDFluidTouchGestureData);
@@ -231,37 +224,28 @@ static CGEventRef augment_dock_swipe_event(CGEventRef event) {
     return result;
 }
 
-static bool requires_event_augmentation(void) {
-    static int cached_result = -1;
-    if (cached_result != -1) return cached_result;
+// Major version of the running macOS, or 0 if it can't be determined.
+static int macos_major(void) {
+    static int major = -1;
+    if (major != -1) return major;
 
-    const char *force_override = getenv("ISS_FORCE_EVENT_AUGMENTATION");
-    if (force_override) {
-        cached_result = strcmp(force_override, "1") == 0;
-        return cached_result;
-    }
-
+    major = 0;
     char version[32];
     size_t size = sizeof(version);
-    if (sysctlbyname("kern.osproductversion", version, &size, NULL, 0) != 0) {
-        cached_result = 0;
-        return false;
+    if (sysctlbyname("kern.osproductversion", version, &size, NULL, 0) == 0) {
+        sscanf(version, "%d", &major);
     }
+    return major;
+}
 
-    int major = 0;
-    if (sscanf(version, "%d", &major) < 1) {
-        cached_result = 0;
-        return false;
-    }
-
-    cached_result = major >= 27;
-    return cached_result;
+static bool requires_event_augmentation(void) {
+    return macos_major() >= 27;
 }
 
 static CFMachPortRef tap;
 static bool swipeTracking, swipeFired;
 static bool interceptTrackpad = true, interceptShortcuts = true;
-static int  shortcutTrackingKey = -1;
+static int shortcutTrackingKey = -1;
 static int passthrough; // synthetic events remaining to let through
 static bool switchInFlight; // a deferred End has not been posted yet
 static uint64_t predictedSpace; // target of our last switch, until CGS catches up
@@ -305,18 +289,16 @@ static CGEventRef make_augmented_dock_event(int phase, bool right) {
     CGEventSetIntegerValueField(ev, kCGSEventTypeField, kCGSEventDockControl);
     CGEventSetIntegerValueField(ev, kCGEventGestureHIDType, kIOHIDEventTypeDockSwipe);
     CGEventSetIntegerValueField(ev, kCGEventGesturePhase, phase);
-    // Began/Changed carry no progress so the Dock opens the gesture without
-    // drawing a partial slide; End carries the full progress.
-    if (phase == kGestureEnded) {
-        CGEventSetDoubleValueField(ev, kCGEventGestureSwipeProgress, right ? -1.0 : 1.0);
-    }
     CGEventSetIntegerValueField(ev, kCGEventGestureSwipeMotion, kCGGestureMotionHorizontal);
     CGEventSetIntegerValueField(ev, kCGEventGesturePhaseAlias, phase);
     CGEventSetDoubleValueField(ev, kCGEventGestureZoomDeltaY, 3.0);
     CGEventSetDoubleValueField(ev, kCGEventSourceProcessAlias,
                                (double)mach_absolute_time());
     CGEventSetDoubleValueField(ev, kCGEventGestureSwipePositionX, 0.1);
+    // Began/Changed carry no progress so the Dock opens the gesture without
+    // drawing a partial slide; End carries the full progress.
     if (phase == kGestureEnded) {
+        CGEventSetDoubleValueField(ev, kCGEventGestureSwipeProgress, right ? -1.0 : 1.0);
         CGEventSetDoubleValueField(ev, kCGEventGestureSwipeVelocityX,
                                    right ? -9999.0 : 9999.0);
     }
@@ -477,14 +459,10 @@ static void post_switch(bool right) {
     post_tracked_pair(end);
 }
 
+// macOS 26 and later report horizontal swipe direction opposite to earlier
+// releases.
 static bool is_right_swipe(double direction) {
-    if (requires_event_augmentation()) return direction > 0.0;
-
-#if ISS_SWIPE_DIRECTION_REVERSED
-    return direction > 0.0;
-#else
-    return direction < 0.0;
-#endif
+    return macos_major() >= 26 ? direction > 0.0 : direction < 0.0;
 }
 
 static bool set_mode(const char *mode) {
@@ -684,9 +662,7 @@ int main(int argc, char **argv) {
 
     // Listen for keyboard, gesture and dock control events.
     tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
-        kCGEventTapOptionDefault,
-        mask,
-        cb, NULL);
+        kCGEventTapOptionDefault, mask, cb, NULL);
     if (!tap) { fprintf(stderr, "Failed to create event tap.\n"); return 1; }
 
     CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(NULL, tap, 0);

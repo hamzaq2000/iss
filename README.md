@@ -25,7 +25,7 @@ Other keyboard shortcuts are left untouched.
 
 ## Compatibility
 
-The pre-27 event path supports the macOS versions where the original synthetic DockControl mechanism works. macOS 27 and later use the serialized IOHID payload path described above. Direction encoding differs between macOS 26 and macOS 27, so the running OS—not the SDK used to build `iss`—determines the interpretation.
+The pre-27 event path supports the macOS versions where the original synthetic DockControl mechanism works. macOS 27 and later use the serialized IOHID payload path described above. macOS 26 and later report horizontal swipe direction opposite to earlier releases; `iss` checks the running OS version, not the SDK it was built with.
 
 ## Install
 
