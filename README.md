@@ -13,11 +13,11 @@ synthetic dock-swipe path. This matters for Logitech Options+: its native
 "Desktop left/right" actions emit those keyboard shortcuts rather than real
 trackpad swipe gestures.
 
-On macOS versions before 27, the synthetic sequence uses the original DockControl fields and high velocity. On macOS 27 and later, `CGEventPost` events need an embedded raw IOHID queue payload in serialized CGEvent field 4205. `iss` constructs the payload, including the fluid-touch and velocity records, appends it to each synthetic phase, and posts the augmented events.
+On macOS versions before 27, the synthetic sequence uses the original DockControl fields and high velocity. On macOS 27 and later, `CGEventPost` events need an embedded raw IOHID queue payload in serialized CGEvent field 4205. `iss` constructs the payload, including the fluid-touch and velocity records, appends it to each synthetic phase, and posts the augmented events. Began and Changed carry no progress; End follows 50 ms later with the full progress, which makes the Dock jump straight to the target space instead of animating.
 
 Each DockControl event is paired with a companion gesture event. A passthrough counter lets those synthetic events pass through the tap without being intercepted again. The real terminal event is also allowed to complete the Dock’s native gesture state on macOS 27.
 
-The macOS 27 path deliberately does not pre-check space boundaries with `CGSGetActiveSpace()`. That API can lag behind the Dock after a synthetic switch, so the Dock itself handles attempts to move past the first or last space.
+Switching past the first or last space is blocked before any event is posted. `CGSGetActiveSpace()` can lag behind the Dock after a synthetic switch, so `iss` treats the target of its own last switch as the current space until that API catches up (or 1 s passes).
 
 No SIP disable or code injection is required. The event type and field indices are undocumented system details, and the macOS 27 IOHID payload layout is reverse-engineered.
 

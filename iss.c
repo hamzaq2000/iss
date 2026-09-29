@@ -12,7 +12,8 @@
 //   3. A synthetic Begin+Changed+End sequence is posted, with each DockControl
 //      event paired with a companion kCGSEventGesture event. Before macOS 27,
 //      the End event uses high velocity (±400); macOS 27 and later also require
-//      a serialized raw IOHID queue payload on every synthetic phase.
+//      a serialized raw IOHID queue payload on every synthetic phase, and End
+//      is posted 50 ms after Began+Changed so the switch doesn't animate.
 //   4. A passthrough counter lets the synthetic events through the tap without
 //      re-interception (CGEvent field tags don't survive CGEventPost).
 //   5. On macOS 27 and later, the real terminal event is passed through after
@@ -32,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/sysctl.h>
+#include <time.h>
 
 // These are private CGEvent fields used by the WindowServer and Dock for
 // trackpad gesture routing. They were discovered via reverse engineering.
@@ -261,6 +263,9 @@ static bool swipeTracking, swipeFired;
 static bool interceptTrackpad = true, interceptShortcuts = true;
 static int  shortcutTrackingKey = -1;
 static int passthrough; // synthetic events remaining to let through
+static bool switchInFlight; // a deferred End has not been posted yet
+static uint64_t predictedSpace; // target of our last switch, until CGS catches up
+static uint64_t predictedAtNs;
 static bool tap_trusted;
 static bool tap_enabled;
 
@@ -268,6 +273,7 @@ static void reset_gesture_state(void) {
     swipeTracking = false;
     swipeFired = false;
     passthrough = 0;
+    predictedSpace = 0;
 }
 
 static bool accessibility_is_trusted(void) {
@@ -335,12 +341,27 @@ static bool post_tracked_pair(CGEventRef dock) {
     return false;
 }
 
-// Check whether there is a space to switch to in the given direction.
-// Queries the private CGS API for the per-display space list and finds
-// the active space's position within it.
-static bool can_switch(bool right) {
+// CGSGetActiveSpace() updates some time after a synthetic switch, so a quick
+// follow-up switch would see the old space. We know where our own switches
+// land, so trust that until CGS reports it or the prediction goes stale.
+static const uint64_t kPredictionTimeoutNs = 1000 * NSEC_PER_MSEC;
+
+static uint64_t current_space(int cid) {
+    uint64_t actual = CGSGetActiveSpace(cid);
+    if (predictedSpace && actual != predictedSpace
+        && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - predictedAtNs < kPredictionTimeoutNs) {
+        return predictedSpace;
+    }
+    predictedSpace = 0;
+    return actual;
+}
+
+// Find the space to switch to in the given direction. Returns false at the
+// first/last space. *target is 0 if the current space can't be located.
+static bool switch_target(bool right, uint64_t *target) {
+    *target = 0;
     int cid = CGSMainConnectionID();
-    uint64_t active = CGSGetActiveSpace(cid);
+    uint64_t active = current_space(cid);
     CFArrayRef displays = CGSCopyManagedDisplaySpaces(cid);
     if (!displays) return true;
 
@@ -356,11 +377,19 @@ static bool can_switch(bool right) {
             if (!sid) continue;
             int64_t val;
             CFNumberGetValue(sid, kCFNumberSInt64Type, &val);
-            if ((uint64_t)val == active) {
-                if (right && j == count - 1) can = false;
-                if (!right && j == 0) can = false;
-                goto done;
+            if ((uint64_t)val != active) continue;
+
+            CFIndex next = right ? j + 1 : j - 1;
+            if (next < 0 || next >= count) {
+                can = false;
+            } else {
+                CFNumberRef nid = CFDictionaryGetValue(
+                    CFArrayGetValueAtIndex(spaces, next), CFSTR("ManagedSpaceID"));
+                int64_t nval = 0;
+                if (nid) CFNumberGetValue(nid, kCFNumberSInt64Type, &nval);
+                *target = (uint64_t)nval;
             }
+            goto done;
         }
     }
 done:
@@ -370,6 +399,7 @@ done:
 
 static void post_deferred_end(void *event) {
     post_tracked_pair((CGEventRef)event);
+    switchInFlight = false;
 }
 
 static void post_augmented_switch(bool right) {
@@ -395,6 +425,7 @@ static void post_augmented_switch(bool right) {
         events[i] = NULL;
     }
 
+    switchInFlight = true;
     // Ending the gesture in the same instant it began makes the Dock animate
     // the switch. Once it has had a moment to open the gesture, End jumps
     // straight to the target space.
@@ -409,12 +440,15 @@ cleanup:
 }
 
 static void post_switch(bool right) {
-    bool augmented = requires_event_augmentation();
-    // On macOS 27, CGSGetActiveSpace() can lag behind the Dock's synthetic
-    // switch, so the Dock itself handles boundary spaces on this path.
-    if (!augmented && !can_switch(right)) return;
+    // Starting a new gesture before the previous End would overlap them.
+    if (switchInFlight) return;
 
-    if (augmented) {
+    uint64_t target;
+    if (!switch_target(right, &target)) return;
+    predictedSpace = target;
+    predictedAtNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+    if (requires_event_augmentation()) {
         post_augmented_switch(right);
         return;
     }
