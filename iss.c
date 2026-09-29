@@ -23,6 +23,7 @@
 
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <float.h>
 #include <mach/mach_time.h>
 #include <signal.h>
@@ -298,7 +299,11 @@ static CGEventRef make_augmented_dock_event(int phase, bool right) {
     CGEventSetIntegerValueField(ev, kCGSEventTypeField, kCGSEventDockControl);
     CGEventSetIntegerValueField(ev, kCGEventGestureHIDType, kIOHIDEventTypeDockSwipe);
     CGEventSetIntegerValueField(ev, kCGEventGesturePhase, phase);
-    CGEventSetDoubleValueField(ev, kCGEventGestureSwipeProgress, right ? -1.0 : 1.0);
+    // Began/Changed carry no progress so the Dock opens the gesture without
+    // drawing a partial slide; End carries the full progress.
+    if (phase == kGestureEnded) {
+        CGEventSetDoubleValueField(ev, kCGEventGestureSwipeProgress, right ? -1.0 : 1.0);
+    }
     CGEventSetIntegerValueField(ev, kCGEventGestureSwipeMotion, kCGGestureMotionHorizontal);
     CGEventSetIntegerValueField(ev, kCGEventGesturePhaseAlias, phase);
     CGEventSetDoubleValueField(ev, kCGEventGestureZoomDeltaY, 3.0);
@@ -363,6 +368,10 @@ done:
     return can;
 }
 
+static void post_deferred_end(void *event) {
+    post_tracked_pair((CGEventRef)event);
+}
+
 static void post_augmented_switch(bool right) {
     CGEventRef events[3] = { NULL, NULL, NULL };
     const int phases[3] = { kGestureBegan, kGestureChanged, kGestureEnded };
@@ -375,7 +384,7 @@ static void post_augmented_switch(bool right) {
         if (!events[i]) goto cleanup;
     }
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         if (!post_tracked_pair(events[i])) {
             events[i] = NULL;
             for (int j = i + 1; j < 3; j++) {
@@ -385,6 +394,12 @@ static void post_augmented_switch(bool right) {
         }
         events[i] = NULL;
     }
+
+    // Ending the gesture in the same instant it began makes the Dock animate
+    // the switch. Once it has had a moment to open the gesture, End jumps
+    // straight to the target space.
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+                     dispatch_get_main_queue(), events[2], post_deferred_end);
     return;
 
 cleanup:
@@ -429,7 +444,7 @@ static void post_switch(bool right) {
 }
 
 static bool is_right_swipe(double direction) {
-    if (requires_event_augmentation()) return direction < 0.0;
+    if (requires_event_augmentation()) return direction > 0.0;
 
 #if ISS_SWIPE_DIRECTION_REVERSED
     return direction > 0.0;
