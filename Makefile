@@ -5,11 +5,19 @@ AGENT_DIR = $(HOME)/Library/LaunchAgents
 PLIST     = $(AGENT_DIR)/$(LABEL).plist
 MODE     ?=
 
+# Xcode 26.x's linker (TAPI 21.0.0) cannot parse the arm64e.x1 slices in the
+# newer CommandLineTools MacOSX27 SDK, so pin to the newest SDK the active
+# toolchain understands. Re-check after updating Xcode: if the default SDK's
+# .tbd files link cleanly, this pin can be dropped.
+SDKROOT ?= $(shell xcrun --sdk macosx26.5 --show-sdk-path 2>/dev/null || xcrun --sdk macosx --show-sdk-path 2>/dev/null)
 CFLAGS  ?= -std=c11 -O3 -march=native -pipe -flto -Wall -Wextra -Wpedantic
+ifneq ($(SDKROOT),)
+CFLAGS  += -isysroot $(SDKROOT)
+endif
 LDFLAGS  = -framework ApplicationServices -framework CoreFoundation \
            -Wl,-dead_strip -Wl,-dead_strip_dylibs -Wl,-x
 
-$(BIN): iss.c
+$(BIN): iss.c Makefile
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 lint: iss.c
@@ -65,4 +73,4 @@ uninstall:
 clean:
 	rm -f $(BIN)
 
-.PHONY: install uninstall clean
+.PHONY: install uninstall clean lint
